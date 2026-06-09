@@ -27,6 +27,7 @@ pub mod uapi;
 
 use crate::noise::index_table::IndexTable;
 use builder::Nul;
+use futures::TryFutureExt;
 use std::collections::HashMap;
 use std::io::{self};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
@@ -34,8 +35,8 @@ use std::ops::BitOrAssign;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 use tokio::join;
-use tokio::sync::Mutex;
 use tokio::sync::RwLock;
+use tokio::sync::{Mutex, watch};
 
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::parse_handshake_anon;
@@ -43,7 +44,6 @@ use crate::noise::rate_limiter::RateLimiter;
 use crate::noise::{Tunn, TunnResult};
 use crate::packet::{PacketBufPool, WgKind};
 use crate::task::Task;
-use crate::tun::buffer::{BufferedIpRecv, BufferedIpSend};
 use crate::tun::{IpRecv, IpSend, MtuWatcher};
 use crate::udp::buffer::{BufferedUdpReceive, BufferedUdpSend};
 use crate::udp::{UdpRecv, UdpSend, UdpTransportFactory, UdpTransportFactoryParams};
@@ -87,9 +87,9 @@ pub enum Error {
 }
 
 /// A reference-counted handle to a WireGuard device.
-#[derive(Clone)]
 pub struct Device<T: DeviceTransports> {
     inner: Arc<RwLock<DeviceState<T>>>,
+    fatal_error: watch::Receiver<Option<Error>>,
 }
 
 /// Entry point for building a [`Device`].
@@ -130,6 +130,10 @@ pub(crate) struct DeviceState<T: DeviceTransports> {
 
     /// The task that responds to API requests.
     api: Option<Task>,
+
+    /// If an unrecoverable error occurs (such as the TUN device being deleted),
+    /// it will be stored here and propagated to all [`Device`] handles.
+    fatal_error: watch::Sender<Option<Error>>,
 }
 
 pub(crate) struct Connection<T: DeviceTransports> {
@@ -152,90 +156,99 @@ pub(crate) struct Connection<T: DeviceTransports> {
 }
 
 impl<T: DeviceTransports> Connection<T> {
-    pub async fn set_up(device: Arc<RwLock<DeviceState<T>>>) -> Result<Self, Error> {
-        let mut device_guard = device.write().await;
+    pub async fn set_up(device_arc: Arc<RwLock<DeviceState<T>>>) -> Result<(), Error> {
+        let mut device = device_arc.write().await;
         let pool = PacketBufPool::new(MAX_PACKET_BUFS);
 
         // clean up existing connection
-        if let Some(conn) = device_guard.connection.take() {
+        if let Some(conn) = device.connection.take() {
             conn.stop().await;
         }
 
-        let (udp4_tx, udp4_rx, udp6_tx, udp6_rx) = device_guard.open_listen_socket().await?;
-        let buffered_ip_rx = BufferedIpRecv::new(
+        let (udp4_tx, udp4_rx, udp6_tx, udp6_rx) = device.open_listen_socket().await?;
+        let (buffered_ip_tx, buffered_ip_rx) = crate::tun::buffer::channel(
             MAX_PACKET_BUFS,
             pool.clone(),
-            Arc::clone(&device_guard.tun_rx),
-        );
-        let buffered_ip_tx = BufferedIpSend::new(MAX_PACKET_BUFS, Arc::clone(&device_guard.tun_tx));
+            Arc::clone(&device.tun_tx),
+            Arc::clone(&device.tun_rx),
+        )
+        .await;
 
         let buffered_udp_tx_v4 = BufferedUdpSend::new(MAX_PACKET_BUFS, udp4_tx.clone());
         let buffered_udp_tx_v6 = BufferedUdpSend::new(MAX_PACKET_BUFS, udp6_tx.clone());
 
-        let buffered_udp_rx_v4 = BufferedUdpReceive::new::<
-            <T::UdpTransportFactory as UdpTransportFactory>::RecvV4,
-        >(MAX_PACKET_BUFS, udp4_rx, pool.clone());
-        let buffered_udp_rx_v6 = BufferedUdpReceive::new::<
-            <T::UdpTransportFactory as UdpTransportFactory>::RecvV6,
-        >(MAX_PACKET_BUFS, udp6_rx, pool.clone());
+        let buffered_udp_rx_v4 = BufferedUdpReceive::new(MAX_PACKET_BUFS, udp4_rx, pool.clone());
+        let buffered_udp_rx_v6 = BufferedUdpReceive::new(MAX_PACKET_BUFS, udp6_rx, pool.clone());
 
         // Start DAITA/hooks tasks
         #[cfg(feature = "daita")]
-        for peer_arc in device_guard.peers.values() {
+        for peer_arc in device.peers.values() {
             PeerState::maybe_start_daita(
                 peer_arc,
                 pool.clone(),
-                device_guard.tun_rx_mtu.clone(),
+                device.tun_rx_mtu.clone(),
                 buffered_udp_tx_v4.clone(),
                 buffered_udp_tx_v6.clone(),
             )
             .await?;
         }
 
-        drop(device_guard);
+        let fatal_error = device.fatal_error.clone();
+        let register_fatal_error = move |e| {
+            fatal_error.send_if_modified(|option| {
+                let has_error = option.is_some();
+                if !has_error {
+                    *option = Some(e);
+                }
+                !has_error
+            })
+        };
 
         // Start device tasks
         let outgoing = Task::spawn(
             "handle_outgoing",
             DeviceState::handle_outgoing(
-                Arc::downgrade(&device),
+                Arc::downgrade(&device_arc),
                 buffered_ip_rx,
                 buffered_udp_tx_v4.clone(),
                 buffered_udp_tx_v6.clone(),
                 pool.clone(),
-            ),
+            )
+            .map_err(register_fatal_error.clone()),
         );
         let timers = Task::spawn(
             "handle_timers",
             DeviceState::handle_timers(
-                Arc::downgrade(&device),
+                Arc::downgrade(&device_arc),
                 buffered_udp_tx_v4.clone(),
                 buffered_udp_tx_v6.clone(),
             ),
         );
-
         let incoming_ipv4 = Task::spawn(
             "handle_incoming ipv4",
             DeviceState::handle_incoming(
-                Arc::downgrade(&device),
+                Arc::downgrade(&device_arc),
                 buffered_ip_tx.clone(),
                 buffered_udp_tx_v4,
                 buffered_udp_rx_v4,
                 pool.clone(),
-            ),
+            )
+            .map_err(register_fatal_error.clone()),
         );
         let incoming_ipv6 = Task::spawn(
             "handle_incoming ipv6",
             DeviceState::handle_incoming(
-                Arc::downgrade(&device),
+                Arc::downgrade(&device_arc),
                 buffered_ip_tx,
                 buffered_udp_tx_v6,
                 buffered_udp_rx_v6,
                 pool.clone(),
-            ),
+            )
+            .map_err(register_fatal_error.clone()),
         );
 
-        Ok(Connection {
+        debug_assert!(device.connection.is_none());
+        device.connection = Some(Connection {
             listen_port: udp4_tx.local_addr()?.map(|sa| sa.port()),
             udp4: udp4_tx,
             udp6: udp6_tx,
@@ -243,7 +256,9 @@ impl<T: DeviceTransports> Connection<T> {
             incoming_ipv6,
             timers,
             outgoing,
-        })
+        });
+
+        Ok(())
     }
 }
 
@@ -265,6 +280,14 @@ impl<T: DeviceTransports> Device<T> {
         if let Some(connection) = device.connection.take() {
             connection.stop().await;
         }
+    }
+
+    /// Wait until an unrecoverable error occurs.
+    pub async fn wait(&mut self) {
+        self.fatal_error
+            .wait_for(|err| err.is_some())
+            .await
+            .expect("Sender will not be dropped while Self exists");
     }
 }
 
@@ -547,9 +570,10 @@ impl<T: DeviceTransports> DeviceState<T> {
         };
 
         while let Ok((src_buf, addr)) = udp_rx.recv_from(&mut packet_pool).await {
-            let parsed_packet = match rate_limiter.verify_packet(addr.ip(), src_buf) {
+            let parsed_packet = match rate_limiter.verify_packet(addr, src_buf) {
                 Ok(packet) => packet,
                 Err(TunnResult::WriteToNetwork(WgKind::CookieReply(cookie))) => {
+                    // Note: Cookies should not affect counters.
                     if let Err(_err) = udp_tx.send_to(cookie.into(), addr).await {
                         log::trace!("udp.send_to failed");
                         break;
@@ -662,9 +686,9 @@ impl<T: DeviceTransports> DeviceState<T> {
                         continue;
                     }
 
-                    if let Err(_err) = tun_tx.send(packet).await {
+                    if let Err(e) = tun_tx.send(packet).await {
                         log::trace!("buffered_tun_send.send failed");
-                        break;
+                        return Err(Error::IoError(e));
                     }
                 }
             }
@@ -680,10 +704,10 @@ impl<T: DeviceTransports> DeviceState<T> {
         udp4: impl UdpSend,
         udp6: impl UdpSend,
         mut packet_pool: PacketBufPool,
-    ) {
+    ) -> Result<(), Error> {
         let mut tun_mtu = {
             let Some(device) = device.upgrade() else {
-                return;
+                return Ok(());
             };
             let device = device.read().await;
             device.tun_rx_mtu.clone()
@@ -694,7 +718,7 @@ impl<T: DeviceTransports> DeviceState<T> {
                 Ok(packets) => packets,
                 Err(e) => {
                     log::error!("Unexpected error on tun interface: {e:?}");
-                    break;
+                    return Err(Error::IoError(e));
                 }
             };
 
@@ -705,7 +729,7 @@ impl<T: DeviceTransports> DeviceState<T> {
                 };
 
                 let Some(device_arc) = device.upgrade() else {
-                    return;
+                    return Ok(());
                 };
 
                 let device_guard = device_arc.read().await;

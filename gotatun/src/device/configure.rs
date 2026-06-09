@@ -207,6 +207,7 @@ impl<T: DeviceTransports> DeviceWrite<'_, T> {
 
     /// Remove all peers, returning the number of peers removed.
     pub fn clear_peers(&mut self) -> usize {
+        self.reconfigure = Reconfigure::Yes;
         self.device.clear_peers()
     }
 
@@ -472,11 +473,9 @@ impl<T: DeviceTransports> Device<T> {
 
         if let Reconfigure::Yes = configurator.reconfigure {
             // TODO: don't do this elsewhere for ApiServer?
-            // FIXME: set_up acquires lock but we should reuseit
+            // FIXME: set_up acquires lock but we should reuse it
             drop(state);
-            let con = Connection::set_up(self.inner.clone()).await?;
-            let mut state = self.inner.write().await;
-            state.connection = Some(con);
+            Connection::set_up(self.inner.clone()).await?;
         }
 
         Ok(t)

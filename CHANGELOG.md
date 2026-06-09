@@ -8,9 +8,86 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 
+## [0.7.1] - 2026-05-26
+### Added
+- Re-export `tun` crate.
+
+### Fixed
+- Guard against `MtuWatcher` panicking on extreme MTU values.
+- Reconfigure WireGuard device after calling `DeviceWrite::clear_peers`.
+
+
+## [0.7.0] - 2026-05-22
+### Added
+- Enable doc_cfg feature for docs.rs.
+  https://doc.rust-lang.org/unstable-book/language-features/doc-cfg.html
+- Add `mimalloc` and `jemalloc` as optional, alternative memory allocators.
+- Add `Decoder` trait for parsing and validating byte slices as packet types,
+  with implementations for IPv4/v6/TCP/UDP
+- Add TCP packet types.
+- Add more function for computing internet checksums.
+- Allow UDP send/recv buffer sizes (`SO_SNDBUF`/`SO_RCVBUF`) to be configured via
+  `DeviceBuilder::udp_send_buffer_size` and `DeviceBuilder::udp_recv_buffer_size`.
+
+### Changed
+- Rename `CheckedPayload` trait to `PoD`.
+- `gotatun::udp::socket::UdpSocketFactory` now uses operating system default values for `SO_SNDBUF`
+  and `SO_RCVBUF` (instead of forcibly adjusting them to 7 MB each).
+
+
+## [0.6.0] - 2026-04-30
+### Added
+- Add `ring` and `aws-lc-rs` Cargo features to both `gotatun` and
+  `gotatun-cli`, selecting the AEAD backend at compile time. `aws-lc-rs`
+  is the new default. `aws-lc-rs` wins if both features are enabled, and
+  then `ring` is built and linked for nothing.
+
+#### Windows
+- Add support for GotaTun CLI on Windows
+
+### Changed
+- The default AEAD backend is now `aws-lc-rs`. Consumers that still want
+  `ring` can opt in by building with `--no-default-features --features ring`.
+- Make the `ring` dependency optional, gated behind the new `ring` feature.
+
+### Removed
+- Remove `tun::buffer` and `udp::buffer` modules.
+- `Device` is no longer `Clone`.
+
+### Fixed
+- Make tunnel stats counters more consistent with other WG implementations.
+- Exit gracefully when TUN device is deleted externally.
+
+### Security
+- Include source port in cookie MAC input. The WireGuard whitepaper states that the cookie
+  should be computed using the remote endpoint's address, being both the IP and port.
+  But the cookie was only using the sender's IP address. This weakened the built in DoS
+  mitigation by allowing for example multiple clients behind NAT to reuse a cookie issued
+  to a different source port.
+
+
+## [0.5.1] - 2026-04-02
+### Fixed
+- Handle UDP `bind` failing when a randomly selected port is in use for IPv6.
+
+
+## [0.5.0] - 2026-03-26
+### Changed
+- Remove unused function `Tunn::active_receiving_indices`. This is semver breaking since it is
+  public.
+
+### Fixed
+- Apply jitter to handshake initiation retry interval.
+- Fix crash caused by race condition when setting up tunnel.
+
+#### Linux
+- Fix Linux IPv6 source address parsing in `UdpSocket::recv_many_from`.
+
+
 ## [0.4.1] - 2026-03-11
 ### Fixed
 - Fix handshake responses being discarded after at most 250 ms.
+- Fix UDP source port max value being 2^16-2 instead of 2^16-1 in channel based implementation.
 
 #### Linux
 - Fix packet loss when sending on the UDP socket using `sendmmsg`.

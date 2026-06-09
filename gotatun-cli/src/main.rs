@@ -12,17 +12,33 @@
 
 // Common imports that are used on both platforms
 
+// Only use an alternative allocator if one is explicitly chosen (i.e. not when compiling with
+// 'all-features').
+#[cfg(all(
+    any(feature = "mimalloc", feature = "jemalloc"),
+    not(all(feature = "mimalloc", feature = "jemalloc"))
+))]
+mod allocator;
+
 // Unix implementation
 #[cfg(unix)]
 mod unix;
+
+// Windows implementation
+#[cfg(windows)]
+mod windows;
 
 #[cfg(unix)]
 fn main() {
     unix::main();
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn main() {
-    // Empty main function for Windows
-    unimplemented!("GotaTun CLI is not supported on Windows");
+    windows::main();
+}
+
+#[cfg(not(any(unix, windows)))]
+fn main() {
+    unimplemented!("GotaTun CLI is not supported on this platform");
 }

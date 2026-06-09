@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, watch};
 use x25519_dalek::StaticSecret;
 
 use crate::device::Error;
@@ -90,7 +90,7 @@ impl<X, Y> DeviceBuilder<Nul, X, Y> {
     /// Create a WireGuard device that reads/writes incoming/outgoing packets using a UDP socket.
     /// This is the conventional device kind.
     pub fn with_default_udp(self) -> DeviceBuilder<UdpSocketFactory, X, Y> {
-        self.with_udp(UdpSocketFactory)
+        self.with_udp(UdpSocketFactory::default())
     }
 
     /// Create a WireGuard device with a custom [`UdpTransportFactory`].
@@ -109,6 +109,26 @@ impl<X, Y> DeviceBuilder<Nul, X, Y> {
             #[cfg(target_os = "linux")]
             fwmark: self.fwmark,
         }
+    }
+}
+
+impl<X, Y> DeviceBuilder<UdpSocketFactory, X, Y> {
+    /// Specify the `SO_RCVBUF` argument to the [`UdpTransportFactory`].
+    ///
+    /// Changes the size of the operating system's receive buffer associated
+    /// with the socket.
+    pub const fn udp_recv_buffer_size(mut self, recv_buffer_size: usize) -> Self {
+        self.udp.recv_buffer_size = Some(recv_buffer_size);
+        self
+    }
+
+    /// Specify the `SO_SNDBUF` argument to the [`UdpTransportFactory`].
+    ///
+    /// Changes the size of the operating system's send buffer associated with
+    /// the socket.
+    pub const fn udp_send_buffer_size(mut self, send_buffer_size: usize) -> Self {
+        self.udp.send_buffer_size = Some(send_buffer_size);
+        self
     }
 }
 
@@ -255,7 +275,10 @@ impl<Udp: UdpTransportFactory, TunTx: IpSend, TunRx: IpRecv> DeviceBuilder<Udp, 
             rate_limiter: None,
             port: self.port,
             connection: None,
+            fatal_error: watch::Sender::new(None),
         };
+
+        let fatal_error = state.fatal_error.subscribe();
 
         if let Some(private_key) = self.private_key {
             let _ = state.set_key(private_key).await;
@@ -276,11 +299,9 @@ impl<Udp: UdpTransportFactory, TunTx: IpSend, TunRx: IpRecv> DeviceBuilder<Udp, 
         }
 
         if has_peers {
-            let con = Connection::set_up(inner.clone()).await?;
-            let mut state = inner.write().await;
-            state.connection = Some(con);
+            Connection::set_up(inner.clone()).await?;
         }
 
-        Ok(Device { inner })
+        Ok(Device { inner, fatal_error })
     }
 }
